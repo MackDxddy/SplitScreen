@@ -1,27 +1,141 @@
 import axios from 'axios'
+import { wrapper } from 'axios-cookiejar-support'
+import { CookieJar } from 'tough-cookie'
 import logger from '../config/logger.js'
 
 /**
  * Leaguepedia API Service
  * Fetches League of Legends esports match data from Leaguepedia (via MediaWiki API)
- * 
+ *
  * API Documentation: https://lol.fandom.com/wiki/Help:API_Documentation
  * Cargo Tables: https://lol.fandom.com/wiki/Special:CargoTables
+ * 
+ * AUTHENTICATION:
+ * - Without auth: 5 requests/min
+ * - With auth: 60 requests/min (12x faster!)
+ * 
+ * To enable auth, add to .env:
+ *   LEAGUEPEDIA_BOT_USERNAME=YourUsername@BotName
+ *   LEAGUEPEDIA_BOT_PASSWORD=your_bot_password
+ * 
+ * Create bot password at: https://lol.fandom.com/wiki/Special:BotPasswords
  */
 
 const LEAGUEPEDIA_API_URL = process.env.LEAGUEPEDIA_API_URL || 'https://lol.fandom.com/api.php'
 
 // Retry configuration
-const MAX_RETRIES = 3
+const MAX_RETRIES = 1 // Changed from 3 to 1 to avoid burning rate limit
 const RETRY_DELAY = 1000 // 1 second, will use exponential backoff
 
 class LeaguepediaService {
+  constructor() {
+    // Set up axios client with cookie jar for authentication
+    const jar = new CookieJar()
+    this.client = wrapper(axios.create({ jar }))
+    this.isAuthenticated = false
+    this.authAttempted = false
+    this.lastCallTime = 0 // Track last API call timestamp
+  }
+
+  /**
+   * Ensure minimum 1 second between API calls to avoid per-second rate limits
+   * @private
+   */
+  async enforceRateLimit() {
+    const now = Date.now()
+    const timeSinceLastCall = now - this.lastCallTime
+    const minDelay = 1000 // 1 second minimum between calls
+    
+    if (timeSinceLastCall < minDelay) {
+      const waitTime = minDelay - timeSinceLastCall
+      logger.debug(`Rate limit: waiting ${waitTime}ms before next API call`)
+      await new Promise(resolve => setTimeout(resolve, waitTime))
+    }
+    
+    this.lastCallTime = Date.now()
+  }
+
+  /**
+   * Authenticate with Leaguepedia using bot password
+   * @private
+   */
+  async authenticate() {
+    if (this.authAttempted) {
+      return this.isAuthenticated
+    }
+
+    this.authAttempted = true
+
+    const botUsername = process.env.LEAGUEPEDIA_BOT_USERNAME
+    const botPassword = process.env.LEAGUEPEDIA_BOT_PASSWORD
+
+    if (!botUsername || !botPassword) {
+      logger.info('No Leaguepedia credentials found. Using anonymous access (5 req/min)')
+      return false
+    }
+
+    try {
+      logger.info('Authenticating with Leaguepedia...')
+
+      // Step 1: Get login token (with rate limit enforcement)
+      await this.enforceRateLimit()
+      const tokenResponse = await this.client.get(LEAGUEPEDIA_API_URL, {
+        params: {
+          action: 'query',
+          meta: 'tokens',
+          type: 'login',
+          format: 'json'
+        }
+      })
+
+      const loginToken = tokenResponse.data.query.tokens.logintoken
+
+      // Step 2: Perform login (with rate limit enforcement)
+      await this.enforceRateLimit()
+      const loginResponse = await this.client.post(
+        LEAGUEPEDIA_API_URL,
+        new URLSearchParams({
+          action: 'login',
+          lgname: botUsername,
+          lgpassword: botPassword,
+          lgtoken: loginToken,
+          format: 'json'
+        }),
+        {
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded'
+          }
+        }
+      )
+
+      if (loginResponse.data.login.result === 'Success') {
+        this.isAuthenticated = true
+        logger.info('✅ Leaguepedia authentication successful (60 req/min)')
+        return true
+      } else {
+        logger.error('❌ Leaguepedia authentication failed:', loginResponse.data.login)
+        return false
+      }
+    } catch (error) {
+      logger.error('Error during Leaguepedia authentication:', error.message)
+      return false
+    }
+  }
+
   /**
    * Make a Cargo query to Leaguepedia
    * @param {Object} params - Query parameters
    * @returns {Promise<Object>} API response
    */
   async cargoQuery(params) {
+    // Attempt authentication on first request if credentials are available
+    if (!this.authAttempted) {
+      await this.authenticate()
+    }
+    
+    // Enforce 1-second minimum between API calls
+    await this.enforceRateLimit()
+    
     const defaultParams = {
       action: 'cargoquery',
       format: 'json',
@@ -31,21 +145,37 @@ class LeaguepediaService {
     let lastError
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
       try {
-        logger.debug(`Leaguepedia API request (attempt ${attempt}/${MAX_RETRIES})`, {
+        const authStatus = this.isAuthenticated ? 'AUTH' : 'ANON'
+        logger.debug(`Leaguepedia API request [${authStatus}] (attempt ${attempt}/${MAX_RETRIES})`, {
           tables: params.tables,
           fields: params.fields?.substring(0, 100) // Log first 100 chars
         })
 
-        const response = await axios.get(LEAGUEPEDIA_API_URL, {
+        const response = await this.client.get(LEAGUEPEDIA_API_URL, {
           params: defaultParams,
           timeout: 30000 // 30 second timeout
         })
 
+        // Log the actual response for debugging
+        if (!response.data.cargoquery) {
+          logger.warn('Unexpected API response format', {
+            hasCargoquery: !!response.data.cargoquery,
+            hasError: !!response.data.error,
+            responseKeys: Object.keys(response.data),
+            error: response.data.error
+          })
+        }
+
         if (response.data && response.data.cargoquery) {
-          logger.info('Leaguepedia API request successful', {
+          logger.info(`Leaguepedia API request successful [${authStatus}]`, {
             results: response.data.cargoquery.length
           })
           return response.data.cargoquery
+        }
+
+        // Check if it's an API error response
+        if (response.data.error) {
+          throw new Error(`Leaguepedia API error: ${response.data.error.code || response.data.error.info || 'Unknown error'}`)
         }
 
         throw new Error('Invalid response format from Leaguepedia')
@@ -97,7 +227,7 @@ class LeaguepediaService {
 
       // Convert timestamp to Leaguepedia format (YYYY-MM-DD HH:MM:SS)
       let whereClause = `OverviewPage="${overviewPage}"`
-      
+
       if (sinceTimestamp) {
         const date = new Date(sinceTimestamp)
         const formattedDate = date.toISOString().replace('T', ' ').substring(0, 19)
@@ -119,8 +249,8 @@ class LeaguepediaService {
       }
 
       // Parse and format game data
-      const games = gamesData.map(game => this.parseGameData(game.title))
-      
+      const games = gamesData.map(game => this.parseGameData(game.title)).filter(g => g !== null)
+
       logger.info(`Fetched ${games.length} games from Leaguepedia`)
       return games
 
@@ -193,7 +323,7 @@ class LeaguepediaService {
 
       const teamData = await this.cargoQuery({
         tables: 'ScoreboardTeams',
-        fields: 'GameId, Team, Dragons, RiftHerald, Barons, Towers, Inhibitors, TeamKills',
+        fields: 'GameId, Team, Dragons, RiftHeralds, Barons, Towers, Inhibitors, Kills',
         where: `GameId="${gameId}"`,
         limit: 2 // 2 teams per game
       })
@@ -207,11 +337,11 @@ class LeaguepediaService {
         gameId: team.title.GameId,
         team: team.title.Team,
         dragons: parseInt(team.title.Dragons) || 0,
-        riftHeralds: parseInt(team.title.RiftHerald) || 0,
+        riftHeralds: parseInt(team.title.RiftHeralds) || 0,
         barons: parseInt(team.title.Barons) || 0,
         turrets: parseInt(team.title.Towers) || 0,
         inhibitors: parseInt(team.title.Inhibitors) || 0,
-        totalKills: parseInt(team.title.TeamKills) || 0
+        totalKills: parseInt(team.title.Kills) || 0
       }))
 
       logger.info(`Fetched stats for ${stats.length} teams`, { gameId })
@@ -227,17 +357,58 @@ class LeaguepediaService {
   }
 
   /**
+   * Extract week number from GameId
+   * GameId format: "LPL/2026 Season/Split 1_Week 3_6_1"
+   * Returns: "Week 3"
+   * @param {string} gameId - Leaguepedia GameId
+   * @returns {string|null} Week string (e.g., "Week 3") or null
+   */
+  extractTabFromGameId(gameId) {
+    if (!gameId) return null
+
+    // Match pattern: _Week X_ where X is a number
+    const match = gameId.match(/_Week (\d+)_/)
+    if (match) {
+      return `Week ${match[1]}`
+    }
+
+    return null
+  }
+
+  /**
    * Parse raw game data from Leaguepedia into our format
    * @param {Object} rawGame - Raw game data from Leaguepedia
    * @returns {Object} Formatted game object
    */
   parseGameData(rawGame) {
     try {
+      // Handle DateTime field - API returns "DateTime UTC" (with space)
+      let matchDate = null
+      const dateTimeField = rawGame.DateTime_UTC || rawGame['DateTime UTC']
+      
+      if (dateTimeField) {
+        // If DateTime already has timezone info, use it directly
+        if (dateTimeField.includes('Z') || dateTimeField.includes('+')) {
+          matchDate = new Date(dateTimeField)
+        } else {
+          // Otherwise assume UTC and add Z
+          matchDate = new Date(dateTimeField + 'Z')
+        }
+        // If date is invalid, set to null
+        if (isNaN(matchDate.getTime())) {
+          matchDate = null
+        }
+      }
+
+      // Extract tab (week) from GameId
+      const tab = this.extractTabFromGameId(rawGame.GameId)
+
       return {
         externalId: rawGame.GameId,
         tournament: rawGame.Tournament,
-        matchDate: new Date(rawGame.DateTime_UTC + 'Z'), // Add Z for UTC
+        matchDate: matchDate,
         region: rawGame.OverviewPage,
+        tab: tab,
         blueTeam: rawGame.Team1,
         redTeam: rawGame.Team2,
         winner: rawGame.Winner,
@@ -247,7 +418,7 @@ class LeaguepediaService {
       }
     } catch (error) {
       logger.error('Error parsing game data', {
-        gameId: rawGame.GameId,
+        gameId: rawGame?.GameId,
         error: error.message
       })
       return null
@@ -261,45 +432,27 @@ class LeaguepediaService {
    */
   parseGameLength(gamelength) {
     if (!gamelength) return 0
-    
+
     const parts = gamelength.split(':')
     if (parts.length !== 2) return 0
-    
+
     const minutes = parseInt(parts[0]) || 0
     const seconds = parseInt(parts[1]) || 0
-    
+
     return (minutes * 60) + seconds
   }
 
   /**
-   * Test API connectivity
-   * @returns {Promise<boolean>} True if API is accessible
+   * Extract region code from full OverviewPage string
+   * Example: "LPL/2026 Season/Split 1" -> "LPL"
+   * @param {string} overviewPage - Full OverviewPage string
+   * @returns {string} Region code
    */
-  async testConnection() {
-    try {
-      logger.info('Testing Leaguepedia API connection...')
-      
-      const result = await this.cargoQuery({
-        tables: 'ScoreboardGames',
-        fields: 'GameId',
-        limit: 1
-      })
-
-      const isConnected = result && result.length > 0
-      logger.info('Leaguepedia API connection test', { 
-        success: isConnected 
-      })
-      
-      return isConnected
-
-    } catch (error) {
-      logger.error('Leaguepedia API connection test failed', {
-        error: error.message
-      })
-      return false
-    }
+  extractRegionCode(overviewPage) {
+    if (!overviewPage) return 'Unknown'
+    const parts = overviewPage.split('/')
+    return parts[0] || 'Unknown'
   }
 }
 
-// Export singleton instance
 export default new LeaguepediaService()
